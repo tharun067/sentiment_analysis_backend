@@ -1,0 +1,30 @@
+[project]
+name = "product-analysis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "asyncpraw>=7.8.1",
+    "backoff>=2.2.1",
+    "beautifulsoup4>=4.14.2",
+    "fastapi>=0.119.0",
+    "firecrawl-py>=4.5.0",
+    "google-api-python-client>=2.185.0",
+    "huggingface-hub[hf-xet]>=0.35.3",
+    "langchain>=1.0.0",
+    "langchain-google-genai>=3.0.0",
+    "langchain-groq>=1.0.0",
+    "motor>=3.7.1",
+    "nltk>=3.9.2",
+    "pydantic>=2.12.3",
+    "python-dotenv>=1.1.1",
+    "requests>=2.32.5",
+    "sentencepiece>=0.2.1",
+    "serpapi>=0.1.5",
+    "tiktoken>=0.12.0",
+    "torch>=2.9.0",
+    "transformers>=4.57.1",
+    "tweepy>=4.16.0",
+    "uvicorn[standard]>=0.37.0",
+]

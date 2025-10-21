@@ -1,0 +1,28 @@
+## For backend dependencies
+fastapi
+uvicorn[standard]
+motor
+pydantic
+python-dotenv
+
+## LLMs
+langchain
+langchain-google-genai
+langchain-groq
+tiktoken
+
+## Hugging Face Models
+transformers
+torch
+sentencepiece
+huggingface_hub[hf_xet]
+
+## web scraping
+tweepy
+asyncpraw
+google-api-python-client
+beautifulsoup4
+serpapi
+nltk
+
+firecrawl-py
