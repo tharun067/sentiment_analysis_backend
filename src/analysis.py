@@ -185,7 +185,7 @@ class GroqAnalysis:
     """Class for performing sentiment analysis using Groq API. With caching and hybrid approach."""
 
     def __init__(self):
-        api_key = "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" #os.getenv('GROQ_API_KEY') or 
+        api_key = os.getenv('GROQ_API_KEY')
         self.client = Groq(api_key=api_key) if api_key else None
         self.transformer_analysis = TransformersAnalysis()
         self._cache = {}
