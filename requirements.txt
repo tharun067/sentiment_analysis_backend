@@ -26,3 +26,4 @@ serpapi
 nltk
 
 firecrawl-py
+backoff
