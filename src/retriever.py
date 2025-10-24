@@ -115,15 +115,57 @@ class YouTubeScraper:
 
 class MultiAPIRetriever:
     def __init__(self):
-        self.twitter = TwitterScraper(os.getenv('TWITTER_BEARER_TOKEN'))
-        self.reddit = RedditScraper(
-            client_id=os.getenv('REDDIT_CLIENT_ID'), client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
-            user_agent=os.getenv('REDDIT_USER_AGENT'), username=os.getenv('REDDIT_USERNAME'), password=os.getenv('REDDIT_PASSWORD')
-        )
-        self.google_news = GoogleNewsScraper(os.getenv('SERPAPI_API_KEY'))
-        self.youtube = YouTubeScraper(os.getenv('YOUTUBE_API_KEY'))
-        self.firecrawl = FirecrawlScraper(os.getenv('FIRECRAWL_API_KEY'))
-        logger.info("MultiAPIRetriever initialized.")
+        # Store credentials but don't initialize clients yet
+        self._twitter_token = os.getenv('TWITTER_BEARER_TOKEN')
+        self._reddit_config = {
+            'client_id': os.getenv('REDDIT_CLIENT_ID'),
+            'client_secret': os.getenv('REDDIT_CLIENT_SECRET'),
+            'user_agent': os.getenv('REDDIT_USER_AGENT'),
+            'username': os.getenv('REDDIT_USERNAME'),
+            'password': os.getenv('REDDIT_PASSWORD')
+        }
+        self._serpapi_key = os.getenv('SERPAPI_API_KEY')
+        self._youtube_key = os.getenv('YOUTUBE_API_KEY')
+        self._firecrawl_key = os.getenv('FIRECRAWL_API_KEY')
+        
+        # Lazy-loaded clients
+        self._twitter = None
+        self._reddit = None
+        self._google_news = None
+        self._youtube = None
+        self._firecrawl = None
+        
+        logger.info("MultiAPIRetriever initialized (clients will be created on first use).")
+    
+    @property
+    def twitter(self):
+        if self._twitter is None:
+            self._twitter = TwitterScraper(self._twitter_token)
+        return self._twitter
+    
+    @property
+    def reddit(self):
+        if self._reddit is None:
+            self._reddit = RedditScraper(**self._reddit_config)
+        return self._reddit
+    
+    @property
+    def google_news(self):
+        if self._google_news is None:
+            self._google_news = GoogleNewsScraper(self._serpapi_key)
+        return self._google_news
+    
+    @property
+    def youtube(self):
+        if self._youtube is None:
+            self._youtube = YouTubeScraper(self._youtube_key)
+        return self._youtube
+    
+    @property
+    def firecrawl(self):
+        if self._firecrawl is None:
+            self._firecrawl = FirecrawlScraper(self._firecrawl_key)
+        return self._firecrawl
     
     async def retrieve(self, query: str, max_results_per_api: int = 20) -> List[Dict[str, Any]]:
         # CORRECTED: Uncommented the scrapers to ensure they run.

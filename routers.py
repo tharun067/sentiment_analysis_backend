@@ -17,15 +17,36 @@ router = APIRouter(
     tags=["Sentiment Analysis"]
 )
 
-# Intitilaize services
-try:
-    db_manager = MongoManager()
-    analysis_pipeline = AnalysisPipeline(max_concurrent_llm=5)
-    groq_analyzer = GroqAnalysis()
-    logging.info("Services initialized successfully.")
-except Exception as e:
-    logging.error(f"Error initializing services: {e}")
-    raise e
+# Lazy initialization - services will be created on first use
+_db_manager = None
+__analysis_pipeline = None
+_groq_analyzer = None
+
+def get_db_manager():
+    """Lazy initialization of database manager."""
+    global _db_manager
+    if _db_manager is None:
+        logging.info("Initializing MongoManager...")
+        _db_manager = MongoManager()
+    return _db_manager
+
+def get_analysis_pipeline():
+    """Lazy initialization of analysis pipeline."""
+    global _analysis_pipeline
+    if _analysis_pipeline is None:
+        logging.info("Initializing AnalysisPipeline...")
+        _analysis_pipeline = AnalysisPipeline(max_concurrent_llm=5)
+    return _analysis_pipeline
+
+def get_groq_analyzer():
+    """Lazy initialization of Groq analyzer."""
+    global _groq_analyzer
+    if _groq_analyzer is None:
+        logging.info("Initializing GroqAnalysis...")
+        _groq_analyzer = GroqAnalysis()
+    return _groq_analyzer
+
+logging.info("API Router initialized (services will load on first request).")
 
 @router.post("/start_analysis", response_model=StartResponse)
 async def start_analysis(request: AnalysisRequest, background_tasks: BackgroundTasks, mode: str = Query('hybrid', description="Analysis mode: 'transformers', 'llm', or 'hybrid'", regex="^(transformers|llm|hybrid)$")):
@@ -46,7 +67,7 @@ async def start_analysis(request: AnalysisRequest, background_tasks: BackgroundT
     if not query:
         raise HTTPException(status_code=400, detail="Query must be provided.")
     logging.info(f"Starting analysis for request for query: {query} in mode: {mode}")
-    background_tasks.add_task(analysis_pipeline.run, query, mode)
+    background_tasks.add_task(_analysis_pipeline.run, query, mode)
     return StartResponse(
         status="success",
         query=query,
@@ -71,10 +92,10 @@ async def get_competitors_comparison(request: ComparisonRequest, background_task
     logging.info(f"Starting competitor comparison for products: {products} in mode: {mode}")
     # Trigger background analysis for each product
     for product in products:
-        background_tasks.add_task(analysis_pipeline.run, product, mode)
+        background_tasks.add_task(_analysis_pipeline.run, product, mode)
     
     # Retrieve existing trend data
-    comparison_data = await db_manager.get_competitor_trends(products=products,time_range=time_range)
+    comparison_data = await _db_manager.get_competitor_trends(products=products,time_range=time_range)
 
     return CompetitorComparisonResponse(comparison=comparison_data)
 
@@ -91,7 +112,8 @@ async def get_distribution(query: str, time_range: str = Query('24h', descriptio
     **Note:** Returns all zeros if no data exists for the query.
     """
     try:
-        distribution = await db_manager.get_sentiment_distribution(query=query, time_range=time_range)
+        db = get_db_manager()
+        distribution = await db.get_sentiment_distribution(query=query, time_range=time_range)
 
         # check if any data exists
         total = distribution.positive + distribution.negative + distribution.neutral
@@ -117,7 +139,8 @@ async def get_trends(query: str, time_range: str = Query('24h', description="Tim
     **Use for:** Line charts, area charts, trend visualization
     """
     try:
-        trends = await db_manager.get_sentiment_trends(query=query, time_range=time_range)
+        db = get_db_manager()
+        trends = await db.get_sentiment_trends(query=query, time_range=time_range)
         if not trends:
             logging.warning(f"No trend data found for query: {query} in time range: {time_range}")
             return []
@@ -143,7 +166,8 @@ async def get_summary(query: str, sample_size: int = Query(25, ge=5, le=100, des
     - Overall sentiment for each
     """
     try:
-        docs = await db_manager.get_documents_for_summary(query=query, sample_size=sample_size, time_range=time_range)
+        db = get_db_manager()
+        docs = await db.get_documents_for_summary(query=query, sample_size=sample_size, time_range=time_range)
 
         if not docs['positive'] and not docs['negative']:
             logging.warning(f"No documents found for summary for query: {query} in time range: {time_range}")
@@ -151,8 +175,9 @@ async def get_summary(query: str, sample_size: int = Query(25, ge=5, le=100, des
         
         logging.info(f"Generating summary for query: {query} using {len(docs['positive'])} positive and {len(docs['negative'])} negative documents.")
 
-        positive_summary = await groq_analyzer.generate_structured_summary(docs['positive'], sentiment_context='positive')
-        negative_summary = await groq_analyzer.generate_structured_summary(docs['negative'], sentiment_context='negative')
+        analyzer = get_groq_analyzer()
+        positive_summary = await analyzer.generate_structured_summary(docs['positive'], sentiment_context='positive')
+        negative_summary = await analyzer.generate_structured_summary(docs['negative'], sentiment_context='negative')
 
         return SummaryResponse(
             positive_summary=positive_summary,
@@ -177,7 +202,8 @@ async def get_feed(query: str, limit: int = Query(50, ge=1, le=500, description=
     **Sorted by:** Most recent first
     """
     try:
-        feed = await db_manager.get_recent_feed(query=query, limit=limit)
+        db = get_db_manager()
+        feed = await db.get_recent_feed(query=query, limit=limit)
 
         if not feed:
             logging.warning(f"No feed items found for query: {query}")
@@ -202,7 +228,8 @@ async def get_wordcloud(query: str, time_range: str = Query('24h', description="
     **Note:** Empty list if no aspects were extracted (transformers-only mode doesn't extract aspects)
     """
     try:
-        word_data = await db_manager.get_word_cloud_data(query=query, time_range=time_range)
+        db = get_db_manager()
+        word_data = await db.get_word_cloud_data(query=query, time_range=time_range)
 
         if not word_data:
             logging.warning(f"No word cloud data found for query: {query} in time range: {time_range}")
@@ -226,7 +253,8 @@ async def delete_data(query: str, days: int = Query(30, ge=1, le=365, descriptio
     - Free up database space
     """
     try:
-        await db_manager.delete_old_records(days=days)
+        db = get_db_manager()
+        await db.delete_old_records(days=days)
 
         logging.info(f"Deleted records older than {days} days as requested for query: {query}")
         return {"status": "success", "message": f"Records older than {days} days have been deleted."}
@@ -249,7 +277,8 @@ async def health_check():
     """
     try:
         # Simple check - try to access database
-        await db_manager.collection.find_one({})
+        db = get_db_manager()
+        await db.collection.find_one({})
         
         return {
             "status": "healthy",

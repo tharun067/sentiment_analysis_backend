@@ -19,15 +19,45 @@ class MongoManager:
         return cls._instance
     
     def __init__(self, uri: Optional[str] = None, db_name: str = 'sentimental_analysis'):
-        if hasattr(self, 'client'):
+        if hasattr(self, '_initialized'):
             return  # Already initialized
-        mongo_uri = uri or os.getenv("MONGO_URI")
-        if not mongo_uri:
+        
+        self._initialized = False
+        self._mongo_uri = uri or os.getenv("MONGO_URI")
+        if not self._mongo_uri:
             raise ValueError("MongoDB URI environment variable not set.")
-        self.client: AsyncIOMotorClient = AsyncIOMotorClient(mongo_uri)
-        self.db: AsyncIOMotorDatabase = self.client[db_name]
-        self.collection = self.db['feed_items']
-        logging.info("MongoDB connection Initialized.")
+        self._db_name = db_name
+        self._client: Optional[AsyncIOMotorClient] = None
+        self._db: Optional[AsyncIOMotorDatabase] = None
+        self._collection = None
+        logging.info("MongoManager created (connection will be established on first use).")
+    
+    def _ensure_connected(self):
+        """Lazy initialization of MongoDB connection."""
+        if self._initialized:
+            return
+        
+        logging.info("Establishing MongoDB connection...")
+        self._client = AsyncIOMotorClient(self._mongo_uri)
+        self._db = self._client[self._db_name]
+        self._collection = self._db['feed_items']
+        self._initialized = True
+        logging.info("MongoDB connection established.")
+    
+    @property
+    def client(self) -> AsyncIOMotorClient:
+        self._ensure_connected()
+        return self._client
+    
+    @property
+    def db(self) -> AsyncIOMotorDatabase:
+        self._ensure_connected()
+        return self._db
+    
+    @property
+    def collection(self):
+        self._ensure_connected()
+        return self._collection
     
     @staticmethod
     def get_time_range_filter(time_range: str) -> Dict:

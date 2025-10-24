@@ -19,19 +19,44 @@ class TransformersAnalysis:
         return cls._instance
     
     def __init__(self):
-        """Initializes the analysis pipelines."""
-        if hasattr(self, 'sentiment_analyzer'):
+        """Initializes the analysis pipelines lazily."""
+        if hasattr(self, '_initialized'):
             return
         
-        self.sentiment_analyzer = pipeline(
+        # Mark as initialized but don't load models yet
+        self._initialized = False
+        self._sentiment_analyzer = None
+        self._sentiment_summarizer = None
+        logging.info("TransformersAnalysis created (models will load on first use).")
+    
+    def _ensure_initialized(self):
+        """Lazy initialization of transformer models."""
+        if self._initialized:
+            return
+        
+        logging.info("Loading transformer models...")
+        self._sentiment_analyzer = pipeline(
             "sentiment-analysis",
             model="cardiffnlp/twitter-roberta-base-sentiment-latest"
         )
-        self.sentiment_summarizer = pipeline(
+        self._sentiment_summarizer = pipeline(
             'summarization',
             model="facebook/bart-large-cnn"
         )
-        logging.info("TransformersAnalysis Initialized.")
+        self._initialized = True
+        logging.info("TransformersAnalysis models loaded successfully.")
+    
+    @property
+    def sentiment_analyzer(self):
+        """Lazy-loaded sentiment analyzer."""
+        self._ensure_initialized()
+        return self._sentiment_analyzer
+    
+    @property
+    def sentiment_summarizer(self):
+        """Lazy-loaded sentiment summarizer."""
+        self._ensure_initialized()
+        return self._sentiment_summarizer
     
     def analyze_sentiment(self,text: str) -> Dict:
         """Analyzes seniment with confidence threshold."""
