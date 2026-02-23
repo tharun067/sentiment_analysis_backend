@@ -1,349 +1,351 @@
-from transformers import pipeline
-from typing import List, Dict, Optional
-from .models import AnalysisResult, SummaryData, AspectSentiment
-import os
-from groq import Groq, RateLimitError
-from pydantic import ValidationError
-import backoff
+
 import logging
-from functools import lru_cache
+import os
+import asyncio
+import json
+import re
 import hashlib
+from typing import List, Dict, Any, Optional, Tuple
 
+logger = logging.getLogger(__name__)
 
-class TransformersAnalysis:
-    """Class for performing fast sentiment analysis using local transformers."""
-    _instance = None
-    def __new__(cls,*args, **kwargs):
-        if not cls._instance:
-            cls._instance = super(TransformersAnalysis, cls).__new__(cls)
-        return cls._instance
-    
-    def __init__(self):
-        """Initializes the analysis pipelines lazily."""
-        if hasattr(self, '_initialized'):
-            return
-        
-        # Mark as initialized but don't load models yet
-        self._initialized = False
-        self._sentiment_analyzer = None
-        self._sentiment_summarizer = None
-        logging.info("TransformersAnalysis created (models will load on first use).")
-    
-    def _ensure_initialized(self):
-        """Lazy initialization of transformer models."""
-        if self._initialized:
-            return
-        
-        logging.info("Loading transformer models...")
-        self._sentiment_analyzer = pipeline(
-            "sentiment-analysis",
-            model="cardiffnlp/twitter-roberta-base-sentiment-latest"
-        )
-        self._sentiment_summarizer = pipeline(
-            'summarization',
-            model="facebook/bart-large-cnn"
-        )
-        self._initialized = True
-        logging.info("TransformersAnalysis models loaded successfully.")
-    
-    @property
-    def sentiment_analyzer(self):
-        """Lazy-loaded sentiment analyzer."""
-        self._ensure_initialized()
-        return self._sentiment_analyzer
-    
-    @property
-    def sentiment_summarizer(self):
-        """Lazy-loaded sentiment summarizer."""
-        self._ensure_initialized()
-        return self._sentiment_summarizer
-    
-    def analyze_sentiment(self,text: str) -> Dict:
-        """Analyzes seniment with confidence threshold."""
-        try:
-            result = self.sentiment_analyzer(text)[0]
-            # Map transformer label to standard format
-            label_map = {
-                'positive':'positive',
-                'negative':'negative',
-                'netural':'netural',
-                'label_0':'negative',
-                'label_1':'neutral',
-                'label_2':'positive'
-            }
-            label = label_map.get(result['label'].lower(),'neutral')
-            return {"label":label, "score":result['score']}
-        except Exception as e:
-            logging.error(f"Error analyzing Sentiment: {e}")
-            return {"label": "netural", "score": 0.5}
-
-    def summarize_text(self, texts: List[str], max_length: int = 130, min_length: int = 30) -> str:
-        """Summarizes text with provided input list of text.."""
-        full_text = " ".join(texts)
-
-        if len(full_text) < 50:
-            return full_text
-
-        # Truncate if too long (BART has 1024 token limit only)
-        if len(full_text.split()) > 800:
-            words = full_text.split()[:800]
-            full_text = " ".join(words)
-
-        try:
-            summary = self.sentiment_summarizer(
-                full_text,
-                max_length=max_length,
-                min_length=min_length,
-                do_sample=False
-            )[0]
-            return summary['summary_text']
-        except Exception as e:
-            logging.error("Error summarizing text: {e}")
-            return full_text[:200] + "..."
-    
-    def basic_analysis(self, text: str) -> AnalysisResult:
-        """Creates a bascic AnalysisResult using only Transformers."""
-        sentiment_data = self.analyze_sentiment(text)
-
-        # Map emotions based on sentiment
-        emotion_map = {
-            'positive': ['satisfaction','joy'],
-            'negative':['frustration','disappointment'],
-            'neutral':['neutral']
-        }
-
-        return AnalysisResult(
-            sentiment=sentiment_data['label'],
-            score=sentiment_data['score'],
-            emotions=emotion_map.get(sentiment_data['label'],['neutral']),
-            intent='feedback',
-            aspects=[] #empty aspects for basic analysis
-        )
-
-
-SYSTEM_PROMPT_ASPECTS = """
+_SYSTEM_PROMPT_ASPECTS = """
 You are an expert Aspect-Based Sentiment Analysis (ABSA) system.
-Your task is to analyze user feedback text and extract all specific, explicitly mentioned product or service aspects.
+Extract specific product/service aspects from the user's text.
 
-**Rules:**
+Rules:
+1. Only extract explicitly mentioned features/attributes (e.g. "battery life", "customer support").
+2. Output ONLY a valid JSON object with one key: "aspects".
+3. Each aspect object has: "aspect" (noun), "sentiment" (positive/negative/neutral), "quote" (exact minimal snippet).
 
-1.  Extract *only* specific features, attributes, or components (e.g., "battery life", "UI design", "customer support", "price").
-2.  Ignore vague, general feedback not tied to a specific feature (e.g., "I hate it", "It's good").
-3.  Your output MUST be a single, valid JSON object.
-4.  The JSON object must contain *only* one key: `"aspects"`.
-5.  The value of `"aspects"` must be an array of objects.
-6.  Each object in the array MUST have exactly three keys:
-      * `"aspect"`: The noun or feature name (e.g., "camera", "battery").
-      * `"sentiment"`: The sentiment for that aspect. Must be one of: `"positive"`, `"negative"`, or `"neutral"`.
-      * `"quote"`: The *exact*, minimal, contiguous text snippet from the input that directly supports the aspect and sentiment.
-8.  Do not include any explanations or conversational text.
-
-**Example Input:**
-"The camera on this phone is absolutely amazing, but the battery drains way too fast. The screen is fine, I guess."
-
-**Example Output:**
-```json
-{
-  "aspects": [
-    {
-      "aspect": "camera",
-      "sentiment": "positive",
-      "quote": "camera on this phone is absolutely amazing"
-    },
-    {
-      "aspect": "battery",
-      "sentiment": "negative",
-      "quote": "battery drains way too fast"
-    },
-    {
-      "aspect": "screen",
-      "sentiment": "neutral",
-      "quote": "The screen is fine, I guess."
-    }
-  ]
-}
-```
+Example output:
+{"aspects": [{"aspect": "camera", "sentiment": "positive", "quote": "camera is amazing"}]}
 """
 
-SYSTEM_PROMPT_SUMMARY = """
-You are an expert Text Analyst AI. Your task is to analyze a batch of user comments and consolidate them into a high-level, strategic summary.
-Your output MUST be a single, valid JSON object and nothing else.
 
-**Required JSON Format:**
+class SentimentAnalyzer:
+    _instance = None
 
-```json
-{
-  "overview": "A 1-2 sentence neutral summary of the main topics and themes present in the feedback.",
-  "keyInsights": [
-    "A concise, actionable insight derived from the most significant trends.",
-    "Another key finding, praise, or complaint.",
-    "..."
-  ],
-  "overallSentiment": "positive" | "negative" | "neutral"
-}
-```
-
-**Field Definitions:**
-
-  * `overview`: A brief, factual summary of *what* users are talking about (e.g., "Feedback focuses on the new UI, battery performance, and checkout process.").
-  * `keyInsights`: An array of strings. Each string must be a distinct, significant finding or actionable takeaway. Do not just list topics; provide the insight (e.g., "Users find the new checkout process confusing," not "Checkout Process").
-  * `overallSentiment`: The dominant, aggregate sentiment of the entire batch of comments. Use "neutral" if the sentiment is heavily mixed, balanced, or apathetic.
-
-**Example Input:**
-"The new interface is so much better, I love it. But the app has been really slow since the update, and it crashed twice today. The new shipping tracker is very helpful, though."
-
-**Example Output:**
-```json
-{
-  "overview": "Users are discussing the new interface, app performance post-update, and the shipping tracker feature.",
-  "keyInsights": [
-    "The new interface design is highly praised by users.",
-    "App performance has significantly degraded since the recent update, including slowness and crashes.",
-    "The new shipping tracker is a valued feature."
-  ],
-  "overallSentiment": "neutral"
-}
-```
-"""
-
-class GroqAnalysis:
-    """Class for performing sentiment analysis using Groq API. With caching and hybrid approach."""
+    def __new__(cls):
+        if not cls._instance:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def __init__(self):
-        api_key = os.getenv('GROQ_API_KEY')
-        self.client = Groq(api_key=api_key) if api_key else None
-        self.transformer_analysis = TransformersAnalysis()
-        self._cache = {}
+        if hasattr(self, "_ready"):
+            return
+        self._ready = False
+        self._pipeline = None
+        self._mode = "uninitialized"
+        logger.info("SentimentAnalyzer created (lazy init).")
 
-        if not api_key:
-            logging.warning("GROQ_API_KEY not set. GroqAnalysis will not function.")
-    
-    def _get_cache_key(self, text: str) -> str:
-        """Generates a cache key based on the text content."""
-        return hashlib.sha256(text.encode('utf-8')).hexdigest()
-    
-    @backoff.on_exception(backoff.expo, RateLimitError, max_tries=3)
-    async def _get_chat_completion(self, system_prompt: str, user_content: str):
-        """Helper to get chat completion from Groq with backoff on rate limits."""
-        return self.client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.3,
-            max_tokens=500,
-            response_format={"type": "json_object"}
-        )
-    
-    async def extract_aspects_with_llm(self, text: str) -> List[AspectSentiment]:
-        """Use Groq LLM to extract aspect-based sentiment analysis."""
-        if not self.client:
-            logging.warning("Groq client not initialized. Skipping LLM aspect extraction.")
-            return []
-        
+    def _load(self):
+        """Try loading primary model, then fallbacks."""
+        if self._ready:
+            return
+
+        # Try Transformers
         try:
-            completion = await self._get_chat_completion(SYSTEM_PROMPT_ASPECTS, text)
-            response_text = completion.choices[0].message.content
-            data = eval(response_text)  # Using eval to parse JSON object
-
-            return [
-                AspectSentiment(
-                    aspect=item.get("aspect",""),
-                    sentiment=item.get("sentiment","neutral"),
-                    quote=item.get("quote","")
-                )
-                for item in data.get("aspects", [])
-            ]
-        except Exception as e:
-            logging.error(f"Error extracting aspects with LLM: {e}")
-            return []
-        
-    async def analyze_text(self, text: str, use_hybrid: bool = True) -> Optional[AnalysisResult]:
-        """
-            HYBRID APPROACH: Combines Transformers + LLM
-            - Transformers: Fast sentiment (always)
-            - LLM: Aspect extraction only (when available)
-            
-            This reduces LLM calls by ~80% while maintaining quality.
-        """
-        ### Check cache first
-        cache_key = self._get_cache_key(text)
-        if cache_key in self._cache:
-            logging.info("Cache hit for text analysis.")
-            return self._cache[cache_key]
-        
-        # Step 1: Always use Transformers for basic sentiment analysis(FAST)
-        sentiment_data = self.transformer_analysis.analyze_sentiment(text)
-
-        # Step 2: Use LLM for aspect extraction if enabled and client available(SLOW)
-        aspects = []
-        if use_hybrid and self.client:
-            try:
-                aspects = await self.extract_aspects_with_llm(text)
-            except RateLimitError:
-                logging.warning("Rate limit hit during LLM aspect extraction. Falling back to no aspects.")
-            except Exception as e:
-                logging.error(f"Unexpected error during LLM aspect extraction: {e}")
-        
-        # Step 3: Combine results
-        emotion_map = {
-            'positive': ['satisfaction', 'appreciation'],
-            'negative': ['frustration', 'concern'],
-            'neutral': ['neutral']
-        }
-
-        result = AnalysisResult(
-            sentiment=sentiment_data['label'],
-            score=sentiment_data['score'],
-            emotions=emotion_map.get(sentiment_data['label'], ['neutral']),
-            intent='user_feedback',
-            aspects=aspects
-        )
-
-        # Cache the result
-        self._cache[cache_key] = result
-        return result
-
-    async def generate_structured_summary(self, documents: List[str], sentiment_context: str) -> SummaryData:
-        """Generates a structured summary using Transformers first, LLM as enhancement."""
-        if not documents:
-            return SummaryData(
-                overview="No documents available for summary.",
-                keyInsights=[],
-                overallSentiment="neutral"
+            from transformers import pipeline  # type: ignore
+            self._pipeline = pipeline(
+                "sentiment-analysis",
+                model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+                truncation=True,
+                max_length=512,
             )
-        
-        # Step 1: Use Transformers to create a basic summary(FAST)
-        transformer_summary = self.transformer_analysis.summarize_text(
-            documents[:10], # Limit to first 10 docs for speed
-            max_length=50,
-            min_length=1
+            self._mode = "transformers"
+            self._ready = True
+            logger.info("✅ Transformers model loaded.")
+            return
+        except Exception as e:
+            logger.warning(f"Transformers load failed: {e}. Trying VADER...")
+
+        # Try VADER
+        try:
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # type: ignore
+            self._vader = SentimentIntensityAnalyzer()
+            self._mode = "vader"
+            self._ready = True
+            logger.info("✅ VADER fallback loaded.")
+            return
+        except Exception:
+            pass
+
+        # Try TextBlob
+        try:
+            from textblob import TextBlob  # type: ignore
+            self._mode = "textblob"
+            self._ready = True
+            logger.info("✅ TextBlob fallback loaded.")
+            return
+        except Exception:
+            pass
+
+        logger.error("❌ All sentiment engines failed to load!")
+        self._mode = "none"
+        self._ready = True
+
+    def analyze(self, text: str) -> Dict[str, Any]:
+        """Analyze a single text. Returns sentiment + score."""
+        self._load()
+        text = text.strip()
+        if not text:
+            return {"sentiment": "neutral", "score": 0.5, "mode": self._mode}
+
+        try:
+            if self._mode == "transformers":
+                return self._analyze_transformers(text)
+            elif self._mode == "vader":
+                return self._analyze_vader(text)
+            elif self._mode == "textblob":
+                return self._analyze_textblob(text)
+        except Exception as e:
+            logger.error(f"Analysis error: {e}")
+
+        return {"sentiment": "neutral", "score": 0.5, "mode": "error_fallback"}
+
+    def _analyze_transformers(self, text: str) -> Dict[str, Any]:
+        result = self._pipeline(text[:512])[0]
+        label_map = {
+            "positive": "positive",
+            "negative": "negative",
+            "neutral": "neutral",
+            "label_0": "negative",
+            "label_1": "neutral",
+            "label_2": "positive",
+        }
+        label = label_map.get(result["label"].lower(), "neutral")
+        return {"sentiment": label, "score": round(result["score"], 4), "mode": "transformers"}
+
+    def _analyze_vader(self, text: str) -> Dict[str, Any]:
+        scores = self._vader.polarity_scores(text)
+        compound = scores["compound"]
+        if compound >= 0.05:
+            sentiment = "positive"
+        elif compound <= -0.05:
+            sentiment = "negative"
+        else:
+            sentiment = "neutral"
+        score = (compound + 1) / 2  # normalize to [0,1]
+        return {"sentiment": sentiment, "score": round(score, 4), "mode": "vader_fallback"}
+
+    def _analyze_textblob(self, text: str) -> Dict[str, Any]:
+        from textblob import TextBlob  # type: ignore
+        polarity = TextBlob(text).sentiment.polarity
+        if polarity > 0.1:
+            sentiment = "positive"
+        elif polarity < -0.1:
+            sentiment = "negative"
+        else:
+            sentiment = "neutral"
+        score = (polarity + 1) / 2
+        return {"sentiment": sentiment, "score": round(score, 4), "mode": "textblob_fallback"}
+
+    def analyze_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
+        """Batch analyze a list of texts."""
+        self._load()
+        if self._mode == "transformers":
+            try:
+                # Truncate texts for transformer
+                truncated = [t[:512] for t in texts if t.strip()]
+                results = self._pipeline(truncated, batch_size=16)
+                label_map = {
+                    "positive": "positive",
+                    "negative": "negative",
+                    "neutral": "neutral",
+                    "label_0": "negative",
+                    "label_1": "neutral",
+                    "label_2": "positive",
+                }
+                out = []
+                for r in results:
+                    label = label_map.get(r["label"].lower(), "neutral")
+                    out.append({"sentiment": label, "score": round(r["score"], 4), "mode": "transformers"})
+                return out
+            except Exception as e:
+                logger.warning(f"Batch transformers failed: {e}, falling back to single.")
+
+        return [self.analyze(t) for t in texts]
+
+    @property
+    def mode(self) -> str:
+        self._load()
+        return self._mode
+
+
+class AspectExtractor:
+    """Uses Groq LLM to extract product aspects from review text (with LRU cache)."""
+
+    _instance = None
+
+    def __new__(cls):
+        if not cls._instance:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if hasattr(self, "_ready"):
+            return
+        self._ready = False
+        self._client = None
+        self._cache: Dict[str, List[Dict]] = {}
+
+    def _ensure_client(self):
+        if self._ready:
+            return
+        api_key = os.getenv("GROQ_API_KEY", "")
+        if api_key:
+            try:
+                from groq import Groq  # type: ignore
+                self._client = Groq(api_key=api_key)
+                logger.info("✅ Groq aspect extractor ready.")
+            except ImportError:
+                logger.warning("groq package not installed; aspect extraction disabled.")
+        else:
+            logger.warning("GROQ_API_KEY not set; aspect extraction disabled.")
+        self._ready = True
+
+    def _cache_key(self, text: str) -> str:
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    async def extract_aspects(self, text: str) -> List[Dict[str, Any]]:
+        """Extract aspects via Groq with retry and cache."""
+        self._ensure_client()
+        if not self._client:
+            return []
+
+        key = self._cache_key(text)
+        if key in self._cache:
+            return self._cache[key]
+
+        for attempt in range(1, 4):
+            try:
+                from groq import RateLimitError  # type: ignore
+                response = await asyncio.to_thread(
+                    lambda: self._client.chat.completions.create(
+                        model="openai/gpt-oss-120b",
+                        messages=[
+                            {"role": "system", "content": _SYSTEM_PROMPT_ASPECTS},
+                            {"role": "user", "content": text[:800]},
+                        ],
+                        max_tokens=400,
+                        temperature=0.2,
+                        response_format={"type": "json_object"},
+                    )
+                )
+                raw = response.choices[0].message.content.strip()
+                # Use json.loads (not eval — security fix from original)
+                data = json.loads(raw)
+                aspects = data.get("aspects", [])
+                self._cache[key] = aspects
+                return aspects
+            except Exception as e:
+                if "rate_limit" in str(e).lower() and attempt < 3:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.warning(f"Aspect extraction failed (attempt {attempt}): {e}")
+                break
+        return []
+
+
+_analyzer = SentimentAnalyzer()
+_aspect_extractor = AspectExtractor()
+
+
+
+def analyze_text(text: str) -> Dict[str, Any]:
+    """Analyze a single text (transformers/fallback)."""
+    return _analyzer.analyze(text)
+
+
+def analyze_batch(texts: List[str]) -> List[Dict[str, Any]]:
+    """Batch analyze a list of texts."""
+    return _analyzer.analyze_batch(texts)
+
+
+async def analyze_hybrid(text: str) -> Dict[str, Any]:
+    """
+    Hybrid analysis: Transformers sentiment + Groq aspect extraction.
+    Falls back gracefully if Groq is unavailable.
+    """
+    result = _analyzer.analyze(text)
+    aspects = await _aspect_extractor.extract_aspects(text) if len(text) > 80 else []
+    result["aspects"] = aspects
+    return result
+
+
+async def analyze_batch_hybrid(
+    items: List[Dict[str, Any]],
+    mode: str = "hybrid",
+    llm_sample_rate: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    Batch analyze with configurable mode (mirrors original backend):
+      'transformers' — fast local, no aspects
+      'hybrid'       — Transformers for all + Groq aspects every Nth item
+      'llm'          — Groq aspects attempted on every item
+
+    Returns list of result dicts with 'sentiment', 'score', 'mode', 'aspects'.
+    """
+    results = []
+    total = len(items)
+
+    for idx, item in enumerate(items):
+        text = item.get("text", "")
+        if not text:
+            results.append({"sentiment": "neutral", "score": 0.5, "mode": "skip", "aspects": []})
+            continue
+
+        base = _analyzer.analyze(text)
+
+        if mode == "transformers":
+            base["aspects"] = []
+            results.append(base)
+            continue
+
+        # Decide whether to call LLM for this item
+        use_llm = (
+            mode == "llm"
+            or (mode == "hybrid" and idx % llm_sample_rate == 0 and len(text) > 100)
         )
 
-        # Step 2: Use LLM to refine and structure the summary if client available(SLOW)
-        if self.client and len(documents) > 5:
-            try:
-                combined = "\n".join(f"- {doc[:100]}" for doc in documents[:20])
-                prompt = f"Context: {sentiment_context}\nComments:\n{combined}"
-                completion = await self._get_chat_completion(
-                    SYSTEM_PROMPT_SUMMARY,
-                    prompt
-                )
-                response_text = completion.choices[0].message.content
-                print(response_text)
-                return SummaryData.model_validate_json(response_text)
-            except (RateLimitError, ValidationError, Exception) as e:
-                logging.error(f"Error generating structured summary with LLM: {e}")
-        
-        # Fallback to basic summary if LLM fails
-        return SummaryData(
-            overview=transformer_summary,
-            keyInsights=[f"Based on {len(documents)} documents analyzed."],
-            overallSentiment=sentiment_context
-        )
-    
-    def clear_cache(self):
-        """Clears the internal analysis cache."""
-        self._cache.clear()
-        logging.info("Analysis cache cleared.")
+        if use_llm:
+            aspects = await _aspect_extractor.extract_aspects(text)
+            base["aspects"] = aspects
+        else:
+            base["aspects"] = []
+
+        results.append(base)
+
+    return results
+
+
+def get_analyzer_mode() -> str:
+    return _analyzer.mode
+
+
+
+def extract_word_frequencies(texts: List[str], top_n: int = 50) -> List[Dict[str, Any]]:
+    """Extract word frequencies for word cloud, filtering stop words."""
+    import re
+    from collections import Counter
+
+    STOP_WORDS = {
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "is", "it", "this", "that", "was", "are", "be", "been",
+        "have", "has", "had", "do", "does", "did", "i", "my", "you", "your",
+        "we", "our", "they", "their", "he", "she", "his", "her", "its",
+        "not", "no", "can", "will", "would", "could", "should", "may",
+        "also", "just", "from", "by", "about", "up", "so", "as", "more",
+        "very", "if", "when", "then", "than", "all", "any", "some", "there",
+        "what", "which", "who", "how", "get", "got", "like", "use", "one",
+    }
+
+    word_counts: Dict[str, int] = Counter()
+    for text in texts:
+        words = re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
+        for w in words:
+            if w not in STOP_WORDS:
+                word_counts[w] += 1
+
+    return [{"text": w, "value": c} for w, c in word_counts.most_common(top_n)]
